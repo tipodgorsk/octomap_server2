@@ -28,16 +28,25 @@ namespace octomap_server {
         m_minSizeX(0.0),
         m_minSizeY(0.0),
         m_filterSpeckles(false),
+        m_NeighborsMax(0),
         m_filterGroundPlane(false),
         m_groundFilterDistance(0.04),
         m_groundFilterAngle(0.15),
         m_groundFilterPlaneDistance(0.07),
         m_compressMap(true),
+        m_useMorphologicalFilter(false),
+        m_doLifeCycle(false),
+        m_lifeDuration(10.0),
         m_incrementalUpdate(false) {
 
         rclcpp::Clock::SharedPtr clock = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
+        //rclcpp::Clock::SharedPtr clock = this->get_clock();
+        //this->buffer_ = std::make_shared<tf2_ros::Buffer>(clock);
+
+
         this->buffer_ = std::make_shared<tf2_ros::Buffer>(clock);
         this->buffer_->setUsingDedicatedThread(true);
+
         this->m_tfListener = std::make_shared<tf2_ros::TransformListener>(
             *buffer_, this, false);
         
@@ -46,7 +55,7 @@ namespace octomap_server {
         m_useHeightMap = this->declare_parameter("height_map", m_useHeightMap);
         m_useColoredMap = this->declare_parameter("colored_map", m_useColoredMap);
         m_colorFactor = this->declare_parameter("color_factor", m_colorFactor);
-        
+
         m_pointcloudMinX = this->declare_parameter(
             "pointcloud_min_x", m_pointcloudMinX);
         m_pointcloudMaxX = this->declare_parameter(
@@ -70,14 +79,20 @@ namespace octomap_server {
 
         m_filterSpeckles = this->declare_parameter(
             "filter_speckles", m_filterSpeckles);
+        m_NeighborsMax = this->declare_parameter(
+            "NeighborsMax", m_NeighborsMax);
+
         m_filterGroundPlane = this->declare_parameter(
             "filter_ground", m_filterGroundPlane);
+
         // distance of points from plane for RANSAC
         m_groundFilterDistance = this->declare_parameter(
             "ground_filter/distance", m_groundFilterDistance);
+
         // angular derivation of found plane:
         m_groundFilterAngle = this->declare_parameter(
             "ground_filter/angle", m_groundFilterAngle);
+
         m_groundFilterPlaneDistance = this->declare_parameter(
             "ground_filter/plane_distance", m_groundFilterPlaneDistance);
 
@@ -85,13 +100,21 @@ namespace octomap_server {
             "sensor_model/max_range", m_maxRange);
 
         m_res = this->declare_parameter("resolution", m_res);
+
         double probHit = this->declare_parameter("sensor_model/hit", 0.7);
         double probMiss = this->declare_parameter("sensor_model/miss", 0.4);
         double thresMin = this->declare_parameter("sensor_model/min", 0.12);
         double thresMax = this->declare_parameter("sensor_model/max", 0.97);
+
         m_compressMap = this->declare_parameter("compress_map", m_compressMap);
+
         m_incrementalUpdate = this->declare_parameter(
             "incremental_2D_projection", false);
+
+        m_useMorphologicalFilter = this->declare_parameter("useMorphologicalFilter", m_useMorphologicalFilter);
+        m_doLifeCycle = this->declare_parameter("doLifeCycle", m_doLifeCycle);
+        m_lifeDuration = this->declare_parameter("lifeDuration", m_lifeDuration);
+        
 
         if (m_filterGroundPlane &&
             (m_pointcloudMinZ > 0.0 || m_pointcloudMaxZ < 0.0)) {
@@ -170,6 +193,7 @@ namespace octomap_server {
         this->subscribe();
 
         rclcpp::QoS qos(rclcpp::KeepLast(3));
+        qos.transient_local();
         this->m_markerPub = this->create_publisher<
             visualization_msgs::msg::MarkerArray>(
                 "occupied_cells_vis_array", qos);
@@ -181,16 +205,38 @@ namespace octomap_server {
             sensor_msgs::msg::PointCloud2>(
                 "octomap_point_cloud_centers", qos);
         this->m_mapPub = this->create_publisher<
-            nav_msgs::msg::OccupancyGrid>("projected_map", qos);
+            nav_msgs::msg::OccupancyGrid>("map", qos);
         this->m_fmarkerPub = this->create_publisher<
             visualization_msgs::msg::MarkerArray>(
                 "free_cells_vis_array", qos);
+
+        if(m_doLifeCycle == true){
+            timer_LifeDuration = this->create_wall_timer(
+                std::chrono::duration<float>(m_lifeDuration),
+                std::bind(&OctomapServer::timer_LifeDurationCallback, this)
+            );
+        }
+    }
+
+    void OctomapServer::timer_LifeDurationCallback(){
+
+        auto req = std::make_shared<std_srvs::srv::Empty::Request>();
+        auto resp = std::make_shared<std_srvs::srv::Empty::Response>();
+        if (resetSrv(req, resp)) {
+            RCLCPP_INFO(this->get_logger(), "\nMap Reset !\n");
+        } else {
+            RCLCPP_WARN(this->get_logger(), "\nFailed to reset Map\n");
+        }
     }
 
     void OctomapServer::subscribe() {
+
+
         this->m_pointCloudSub = std::make_shared<
             message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
                 this, "cloud_in", rmw_qos_profile_sensor_data);
+
+
 
         auto create_timer_interface = std::make_shared<tf2_ros::CreateTimerROS>(
             this->get_node_base_interface(),
@@ -203,21 +249,26 @@ namespace octomap_server {
                 this->get_node_logging_interface(),
                 this->get_node_clock_interface(),
                 std::chrono::seconds(1));
+
         this->m_tfPointCloudSub->connectInput(*m_pointCloudSub);
+
         this->m_tfPointCloudSub->registerCallback(
             std::bind(&OctomapServer::insertCloudCallback, this, ph::_1));
 
         this->m_octomapBinaryService = this->create_service<OctomapSrv>(
             "octomap_binary",
             std::bind(&OctomapServer::octomapBinarySrv, this, ph::_1, ph::_2));
+
         this->m_octomapFullService = this->create_service<OctomapSrv>(
             "octomap_full",
             std::bind(&OctomapServer::octomapFullSrv, this, ph::_1, ph::_2));
+
         this->m_clearBBXService = this->create_service<BBXSrv>(
             "clear_bbx",
             std::bind(&OctomapServer::clearBBXSrv, this, ph::_1, ph::_2));
+            
         this->m_resetService = this->create_service<std_srvs::srv::Empty>(
-            "reset", std::bind(&OctomapServer::resetSrv, this, ph::_1, ph::_2));
+            "reset_octomap", std::bind(&OctomapServer::resetSrv, this, ph::_1, ph::_2));
 
         RCLCPP_INFO(this->get_logger(), "Setup completed!");
     }
@@ -323,23 +374,25 @@ namespace octomap_server {
         if (m_filterGroundPlane) {
             geometry_msgs::msg::TransformStamped baseToWorldTf;
             geometry_msgs::msg::TransformStamped sensorToBaseTf;
-            
-            if (!this->buffer_->canTransform(m_baseFrameId, cloud->header.frame_id, cloud->header.stamp, tf2::durationFromSec(1.0))) {
-                double timestamp = cloud->header.stamp.sec + cloud->header.stamp.nanosec * 1e-9;
-                RCLCPP_WARN(this->get_logger(), "\nNo TF between %s and %s at timestamp: %lf", m_baseFrameId.c_str(), cloud->header.frame_id.c_str(), timestamp);
+
+            if (!this->buffer_->canTransform(m_baseFrameId, cloud->header.frame_id, tf2::TimePointZero, tf2::durationFromSec(5.0))) {
+                //double timestamp = cloud->header.stamp.sec + cloud->header.stamp.nanosec * 1e-9;
+                //RCLCPP_WARN(this->get_logger(), "\nNo TF between %s and %s at timestamp: %lf\n", m_baseFrameId.c_str(), cloud->header.frame_id.c_str(), timestamp);
+                RCLCPP_WARN(this->get_logger(), "\nNo TF between %s and %s\n", m_baseFrameId.c_str(), cloud->header.frame_id.c_str());
             }
 
             try {
                 sensorToBaseTf = this->buffer_->lookupTransform(
                     m_baseFrameId, cloud->header.frame_id,
-                    cloud->header.stamp, tf2::durationFromSec(1.0));
+                    tf2::TimePointZero, tf2::durationFromSec(1.0));
 
                 baseToWorldTf = this->buffer_->lookupTransform(
-                    m_worldFrameId, m_baseFrameId, cloud->header.stamp,
+                    m_worldFrameId, m_baseFrameId, tf2::TimePointZero,
                     tf2::durationFromSec(1.0));
 
             } catch (tf2::TransformException& ex) {
                 RCLCPP_ERROR(this->get_logger(), "Transform error for ground plane filter : You need to set the base_frame_id or disable filter_ground\n\t%s", ex.what());
+                return;
             }
 
             Eigen::Matrix4f sensorToBase =
@@ -363,7 +416,7 @@ namespace octomap_server {
         } else {
             // directly transform to map frame:
             pcl::transformPointCloud(pc, pc, sensorToWorld);
-            
+
             // just filter height range:
             pass_x.setInputCloud(pc.makeShared());
             pass_x.filter(pc);
@@ -377,14 +430,20 @@ namespace octomap_server {
             pc_ground.header = pc.header;
             pc_nonground.header = pc.header;
         }
-        
+
         insertScan(sensorToWorldTf.transform.translation,
                    pc_ground, pc_nonground);
 
+
+        if (m_compressMap) {
+            m_octree->prune();
+            //RCLCPP_INFO(this->get_logger(), "\n\nCompressing Map\n");
+        }
+
         auto end = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed_seconds = end - start;
-        RCLCPP_INFO(this->get_logger(), "Time lapse %f", elapsed_seconds.count());
-        
+        //RCLCPP_INFO(this->get_logger(), "Time lapse %f", elapsed_seconds.count());
+
         publishAll(cloud->header.stamp);
     }
 
@@ -431,7 +490,7 @@ namespace octomap_server {
         }
 
         auto start = std::chrono::steady_clock::now();
-        
+
         // all other points: free on ray, occupied on endpoint:
         for (auto it = nonground.begin(); it != nonground.end(); ++it) {
             octomap::point3d point(it->x, it->y, it->z);
@@ -477,8 +536,8 @@ namespace octomap_server {
 
         auto end = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed_seconds = end - start;
-        RCLCPP_INFO(this->get_logger(), "Time lapse[insert] %f", elapsed_seconds.count());
-        
+        //RCLCPP_INFO(this->get_logger(), "Time lapse[insert] %f", elapsed_seconds.count());
+
         // mark free cells only if not seen occupied in this cloud
         for(auto it = free_cells.begin(), end=free_cells.end();
             it!= end; ++it){
@@ -520,10 +579,6 @@ namespace octomap_server {
                          << m_updateBBXMax[0] << " "<< m_updateBBXMax[1]
                          << " "<< m_updateBBXMax[2]);
         */
-
-        if (m_compressMap) {
-            m_octree->prune();
-        }
         
 #ifdef COLOR_OCTOMAP_SERVER
         if (colors) {
@@ -912,6 +967,157 @@ namespace octomap_server {
         }
     }
 
+    void OctomapServer::filterSpecklesGridMap(){
+
+        m_filteredGridMap = m_gridmap;
+
+        uint32_t width = m_gridmap.info.width;
+        uint32_t height = m_gridmap.info.height;
+        uint8_t nb_occupied_neighbors;
+
+        for (uint32_t x = 1; x < width - 1; ++x) {
+            for (uint32_t y = 1; y < height - 1; ++y) {
+                uint64_t idx = x + y * width;
+
+                if (m_gridmap.data[idx] == 100){
+                    nb_occupied_neighbors = GetGridmapNbNeighbors(x,y,width,idx);
+                
+                    if (nb_occupied_neighbors <= m_NeighborsMax) {
+                        m_filteredGridMap.data[idx] = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    uint8_t OctomapServer::GetGridmapNbNeighbors(uint32_t x,uint32_t y,uint32_t width, uint64_t idx){ //Return nb neighbors of an occupied cell
+        
+        uint8_t nb_neighbors = 0;
+
+        for (int8_t dx = -1; dx < 2; ++dx) {
+            for (int8_t dy = -1; dy < 2; ++dy) {
+                uint64_t neighborIdx = (uint64_t)((int64_t)x + dx) + (uint64_t)((int64_t)y + dy) * width;
+                if (m_gridmap.data[neighborIdx] == 100 && neighborIdx!=idx) {
+                    ++nb_neighbors;
+
+                    if(nb_neighbors == (m_NeighborsMax+1)){
+                        return 8;
+                    }
+                }
+            }
+        }
+        return nb_neighbors;
+    }
+
+    nav_msgs::msg::OccupancyGrid OctomapServer::morphologicalFiltering(bool use_filtered_gridmap) { // morphological filtering - Closing
+       
+
+        nav_msgs::msg::OccupancyGrid& originGridMap = (use_filtered_gridmap) ? m_filteredGridMap : m_gridmap;
+        nav_msgs::msg::OccupancyGrid& tempGridMap = (use_filtered_gridmap) ? m_dilatedGridMap : m_filteredGridMap;
+
+        if (use_filtered_gridmap == false) {
+            m_filteredGridMap = m_gridmap;
+        } 
+        else {
+            m_dilatedGridMap = m_filteredGridMap;
+        }
+         
+
+        uint32_t width = originGridMap.info.width;
+        uint32_t height = originGridMap.info.height;
+
+
+        bool applyDilation = false;
+
+        // Parcourir toutes les cellules de la grille d'occupation
+        for (uint32_t x = 1; x < width - 1; ++x) {
+            for (uint32_t y = 1; y < height - 1; ++y) {
+                // Vérifier si la cellule est dans un état connu
+                uint64_t idx = x + y * width;
+                //RCLCPP_INFO(this->get_logger(),"idx : %lu",idx);
+                if (originGridMap.data[idx] == -1) {
+                    continue;
+                }
+                
+                applyDilation = false;
+
+                for (int8_t dx = -1; dx <= 1; dx+=2) {
+                    uint64_t neighborIdx = idx + dx;
+
+                    // Vérifier si le voisin est dans un état connu et exige une cellule occupée (100)
+                    if (originGridMap.data[neighborIdx] != -1 && originGridMap.data[neighborIdx] == 100) {
+                        applyDilation = true;
+                        break;
+                    }
+                }
+
+                for (int8_t dy = -1; dy <= 1; dy+=2) {
+                    // Indice dans le tableau de données (row-major order)
+                    uint64_t neighborIdx = idx + dy * (int64_t)width;
+                    // Vérifier si le voisin est dans un état connu et exige une cellule occupée (100)
+                    if (originGridMap.data[neighborIdx] != -1 && originGridMap.data[neighborIdx] == 100) {
+                        applyDilation = true;
+                        break;
+                    }
+                }
+        
+                // Appliquer la dilatation si applicable
+                if (applyDilation == true) {
+                    tempGridMap.data[idx] = 100;
+                }
+            }
+        }
+
+        // Réinitialiser m_filteredGridMap pour l'érosion
+        nav_msgs::msg::OccupancyGrid closedGridMap = tempGridMap;
+        bool applyErosion = true;
+
+        // Parcourir à nouveau toutes les cellules de la grille d'occupation
+        for (uint32_t x = 1; x < width - 1; ++x) {
+            for (uint32_t y = 1; y < height - 1; ++y) {
+                // Vérifier si la cellule est dans un état connu
+                uint64_t idx = x + y * width;
+                if (originGridMap.data[idx] == -1) {
+                    continue; // Ignorer les cellules dans l'état inconnu
+                }
+
+                // Vérifier l'érosion
+                applyErosion = true;
+
+
+
+                for (int8_t dx = -1; dx <= 1; dx+=2) {
+                    uint64_t neighborIdx = idx + dx;
+
+                    if (tempGridMap.data[neighborIdx] != -1 && tempGridMap.data[neighborIdx] != 100) {
+                        applyErosion = false;
+                        break;
+                    }
+                }
+                
+                for (int8_t dy = -1; dy <= 1; dy+=2) {
+                    // Indice dans le tableau de données (row-major order)
+                    uint64_t neighborIdx = idx + dy * (int64_t)width;
+
+
+                    if (tempGridMap.data[neighborIdx] != -1 && tempGridMap.data[neighborIdx] != 100) {
+                        applyErosion = false;
+                        break;
+                    }
+                }
+
+                if (applyErosion == false) {
+                    closedGridMap.data[idx] = 0;
+                }
+            }
+        }
+
+        return closedGridMap;
+        
+    }
+
+
+
     void OctomapServer::filterGroundPlane(
         const PCLPointCloud& pc,
         PCLPointCloud& ground,
@@ -1041,10 +1247,10 @@ namespace octomap_server {
             octomap::OcTreeKey minKey = m_octree->coordToKey(minPt, m_maxTreeDepth);
             octomap::OcTreeKey maxKey = m_octree->coordToKey(maxPt, m_maxTreeDepth);
 
-            RCLCPP_INFO(
-                this->get_logger(),
-                "MinKey: %d %d %d / MaxKey: %d %d %d",
-                minKey[0], minKey[1], minKey[2], maxKey[0], maxKey[1], maxKey[2]);
+            // RCLCPP_INFO(
+            //     this->get_logger(),
+            //     "MinKey: %d %d %d / MaxKey: %d %d %d",
+            //     minKey[0], minKey[1], minKey[2], maxKey[0], maxKey[1], maxKey[2]);
 
             // add padding if requested (= new min/maxPts in x&y):
             double halfPaddedX = 0.5*m_minSizeX;
@@ -1074,11 +1280,11 @@ namespace octomap_server {
                 return;
             }
 
-            RCLCPP_INFO(
-                this->get_logger(),
-                "Padded MinKey: %d %d %d / padded MaxKey: %d %d %d",
-                m_paddedMinKey[0], m_paddedMinKey[1], m_paddedMinKey[2],
-                paddedMaxKey[0], paddedMaxKey[1], paddedMaxKey[2]);
+            // RCLCPP_INFO(
+            //     this->get_logger(),
+            //     "Padded MinKey: %d %d %d / padded MaxKey: %d %d %d",
+            //     m_paddedMinKey[0], m_paddedMinKey[1], m_paddedMinKey[2],
+            //     paddedMaxKey[0], paddedMaxKey[1], paddedMaxKey[2]);
             assert(paddedMaxKey[0] >= maxKey[0] && paddedMaxKey[1] >= maxKey[1]);
             
             m_multires2DScale = 1 << (m_treeDepth - m_maxTreeDepth);
@@ -1172,7 +1378,28 @@ namespace octomap_server {
     void OctomapServer::handlePostNodeTraversal(
         const rclcpp::Time& rostime){
         if (m_publish2DMap) {
-            m_mapPub->publish(m_gridmap);
+
+            if (m_filterSpeckles == true) {
+
+                filterSpecklesGridMap();
+                //RCLCPP_INFO(this->get_logger(), "\n\nFilter Speckles Map\n");
+
+                if (m_useMorphologicalFilter == true) {
+                    //RCLCPP_INFO(this->get_logger(), "\n\nMORPHOLOGICAL FILTERING\n");
+                    m_mapPub->publish(morphologicalFiltering(true));
+                }
+                else{
+                    m_mapPub->publish(m_filteredGridMap);
+                }
+            }
+
+            else if (m_useMorphologicalFilter == true) {
+                //RCLCPP_INFO(this->get_logger(), "\n\nMORPHOLOGICAL FILTERING\n");
+                m_mapPub->publish(morphologicalFiltering(false));
+            }
+            else{
+                m_mapPub->publish(m_gridmap);
+            }
         }
     }
 

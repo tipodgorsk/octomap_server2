@@ -115,6 +115,7 @@ namespace octomap_server {
         bool m_useHeightMap;
         std_msgs::msg::ColorRGBA m_color;
         std_msgs::msg::ColorRGBA m_colorFree;
+        bool m_useColoredMap;
         double m_colorFactor;
         bool m_publishFreeSpace;
         double m_res;
@@ -131,11 +132,20 @@ namespace octomap_server {
         double m_minSizeX;
         double m_minSizeY;
         bool m_filterSpeckles;
+        uint8_t m_NeighborsMax;
         bool m_filterGroundPlane;
         double m_groundFilterDistance;
         double m_groundFilterAngle;
         double m_groundFilterPlaneDistance;
         bool m_compressMap;
+
+        bool m_useMorphologicalFilter;
+        bool m_doLifeCycle;
+        float m_lifeDuration;
+        std::shared_ptr<rclcpp::TimerBase> timer_LifeDuration;
+
+        void timer_LifeDurationCallback();
+        nav_msgs::msg::OccupancyGrid morphologicalFiltering(bool use_filtered_gridmap);
 
         // downprojected 2D map:
         bool m_incrementalUpdate;
@@ -145,7 +155,6 @@ namespace octomap_server {
         octomap::OcTreeKey m_paddedMinKey;
         unsigned m_multires2DScale;
         bool m_projectCompleteMap;
-        bool m_useColoredMap;
         
         inline static void updateMinKey(const octomap::OcTreeKey& in,
                                         octomap::OcTreeKey& min) {
@@ -202,6 +211,11 @@ namespace octomap_server {
         void filterGroundPlane(const PCLPointCloud& pc,
                                PCLPointCloud& ground,
                                PCLPointCloud& nonground) const;
+        
+        void filterSpecklesGridMap();
+        uint8_t GetGridmapNbNeighbors(uint32_t x,uint32_t y,uint32_t width, uint64_t idx);
+        nav_msgs::msg::OccupancyGrid m_filteredGridMap;
+        nav_msgs::msg::OccupancyGrid m_dilatedGridMap;
 
         bool isSpeckleNode(const octomap::OcTreeKey& key) const;
 
